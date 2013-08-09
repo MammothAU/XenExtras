@@ -1,0 +1,132 @@
+#!/usr/bin/env python
+import mmap, signal, os, sys
+from struct import pack, unpack
+from time import sleep
+
+FREQUENCY = 5
+DATA_RANGE = 15 * 60 / FREQUENCY # 15 minutes
+DATA_FILE = "/var/local/xenload"
+DATA_COMMAND = "/usr/sbin/xm list 2>/dev/null | grep -cE -- '[-r]-----'"
+
+def getCurrentLoadByte():
+	f = os.popen(DATA_COMMAND, "r")
+	data = f.read().strip()
+	value = min(int(data), 254)
+	f.close()
+	return chr(value)
+
+# based on http://code.activestate.com/recipes/278731-creating-a-daemon-the-python-way/
+def forkDaemon():
+	pid = os.fork()
+	if pid != 0:
+		os._exit(0)
+
+	os.setsid()
+
+	# intentional duplicate
+	pid = os.fork()
+	if pid != 0:
+		os._exit(0)
+
+	os.chdir("/")
+	os.umask(022)
+
+	import resource		# Resource usage information.
+	maxfd = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+	if (maxfd == resource.RLIM_INFINITY):
+		maxfd = 1024
+
+	# Iterate through and close all file descriptors.
+	for fd in range(0, maxfd):
+		try:
+			os.close(fd)
+		except OSError:	# ERROR, fd wasn't open to begin with (ignored)
+			pass
+
+	os.open('/dev/null', os.O_RDWR)	# standard input (0)
+	os.dup2(0, 1)			# standard output (1)
+	os.dup2(0, 2)			# standard error (2)
+
+
+def runDaemon():
+	# create data file
+	f = open(DATA_FILE, "wb")
+	for item in range(0,DATA_RANGE):
+		f.write("\xff")
+	f.write("\x00\x00")
+	f.close()
+
+	# write the file
+	position = 0
+
+	f = open(DATA_FILE,"r+b")
+	map = mmap.mmap(f.fileno(), DATA_RANGE + 2)
+
+	def alarmhandler(signum, frame):
+		map.seek(DATA_RANGE)
+		position = unpack("h", map.read(2) )[0]
+		map.seek(position)
+		map.write( getCurrentLoadByte() )
+		map.seek(DATA_RANGE)
+		position = (position + 1) % DATA_RANGE
+		map.write( pack("h", position) )
+		f.flush()
+		signal.alarm(FREQUENCY)
+
+	signal.signal(signal.SIGALRM, alarmhandler)
+	signal.alarm(FREQUENCY)
+
+	while True:
+		sleep(10000)
+	f.close()
+
+
+def get_average(map, position, samples):
+	position -= samples
+	if position < 0:
+		position += DATA_RANGE
+
+	total = 0
+	count = 0
+	for index in range(0,samples):
+		location = (position + index) % DATA_RANGE
+		value = ord(map[location])
+		if value < 255:
+			total += value
+			count += 1
+
+	if count == 0:
+		return 0
+
+	return float(total) / count
+
+def printAverages(formatter):
+	f = open(DATA_FILE, "rb")
+	map = mmap.mmap(f.fileno(), DATA_RANGE + 2, access=mmap.ACCESS_READ)
+
+	map.seek(DATA_RANGE)
+	position = unpack("h", map.read(2) )[0]
+
+	minute1 = get_average(map, position, DATA_RANGE / 15)
+	minute5 = get_average(map, position, DATA_RANGE / 5)
+	minute15 = get_average(map, position, DATA_RANGE)
+
+	formatter(minute1,minute5,minute15)
+
+def prettyPrint(minute1,minute5,minute15):
+	print "xen load average: %.2f, %.2f, %.2f" % (minute1, minute5, minute15)
+
+def cactiPrint(minute1,minute5,minute15):
+	print "load_1min:%.2f load_5min:%.2f load_15min:%.2f" % (minute1, minute5, minute15)
+
+if len(sys.argv) > 1:
+	if sys.argv[1] == '--daemon':
+		forkDaemon()
+		runDaemon()
+	elif sys.argv[1] == '--cacti':
+		printAverages(cactiPrint)
+	else:
+		print 'unrecognised argument'
+else:
+	printAverages(prettyPrint)
+
